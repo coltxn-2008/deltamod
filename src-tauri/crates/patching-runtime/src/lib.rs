@@ -987,11 +987,18 @@ impl Runtime {
             runtime.install(plan, identity, &mut workspace)
         };
         require_lifecycle_success(outcome)?;
-        self.reseal_mac_bundle();
+        let reseal_warning = self.reseal_mac_bundle();
         staged
             .discard_verified()
             .map_err(|error| Error::Staging(error.to_string()))?;
-        emit(progress_event(operation_id, "patching", 1, 1, None, None));
+        emit(progress_event(
+            operation_id,
+            "patching",
+            1,
+            1,
+            None,
+            reseal_warning,
+        ));
         Ok(PatchResult {
             patched: true,
             log: String::new(),
@@ -1172,29 +1179,30 @@ impl Runtime {
             lifecycle_identity(&restore_operation, "restore"),
             &mut workspace,
         ))?;
-        self.reseal_mac_bundle();
+        // Restores have no progress channel; the failure is already logged.
+        let _ = self.reseal_mac_bundle();
         Ok(())
     }
 
     /// Re-signs the macOS game bundle after its resources were replaced or
-    /// restored. Signing failure is logged rather than blocking play: the
-    /// published files are already durable and recoverable.
-    fn reseal_mac_bundle(&self) {
+    /// restored. Signing failure does not block play, because the published
+    /// files are already durable and recoverable, but it is returned as a
+    /// user-facing warning since macOS may then refuse to open the game.
+    fn reseal_mac_bundle(&self) -> Option<String> {
         if self.platform != PatchPlatform::Darwin {
-            return;
+            return None;
         }
-        let Some(bundle) = self
+        let bundle = self
             .definition
             .content_root
             .as_deref()
             .and_then(|root| mac_bundle::bundle_of(&self.game_root, root))
-            .filter(|bundle| bundle.is_dir())
-        else {
-            return;
-        };
-        if let Err(error) = mac_bundle::reseal(&bundle) {
-            eprintln!("[mac] {error}");
-        }
+            .filter(|bundle| bundle.is_dir())?;
+        let error = mac_bundle::reseal(&bundle).err()?;
+        eprintln!("[mac] {error}");
+        Some(format!(
+            "Mods were applied, but re-signing the game copy failed ({error}). If macOS refuses to open DELTARUNE, restore the game from Deltamod and patch again."
+        ))
     }
 
     #[cfg(not(any(unix, windows)))]
