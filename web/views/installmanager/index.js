@@ -84,10 +84,11 @@ const setInterval = (handler, delay, ...args) => {
                         .then(g => g?.name || 'Unknown game');
 
                     details.textContent = `${gname} · ${install.steam ? 'Steam' : 'Manual'}`;
-                    if (!install.valid) {
+                    const issues = Array.isArray(install.issues) ? install.issues : [];
+                    if (!install.valid || issues.length > 0) {
                         const invalid = document.createElement('span');
                         invalid.className = 'installation-invalid';
-                        invalid.textContent = `Needs attention: ${install.issues.join('; ')}`;
+                        invalid.textContent = `Needs attention: ${issues.join('; ')}`;
                         invalid.style.display = 'block';
                         invalid.style.color = '#ffb3a3';
                         invalid.style.marginTop = '4px';

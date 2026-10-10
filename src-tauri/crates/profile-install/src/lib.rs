@@ -662,9 +662,32 @@ impl Runtime {
             return Ok(json!([]));
         }
         let p: ProfileStore = load_json(&path)?;
-        Ok(serde_json::to_value(
-            p.installations.into_iter().take(256).collect::<Vec<_>>(),
-        )?)
+        let mut installations = p.installations.into_iter().take(256).collect::<Vec<_>>();
+        for record in &mut installations {
+            if let Some(issue) = record
+                .index
+                .and_then(|index| self.original_mac_game_issue(index))
+            {
+                record.issues.get_or_insert_with(Vec::new).push(issue);
+            }
+        }
+        Ok(serde_json::to_value(installations)?)
+    }
+
+    /// Flags a macOS installation that points at the original game outside the
+    /// data folder (usually /Applications). Patching refuses those, so the list
+    /// says so up front. The record stays valid: launching it is still fine.
+    fn original_mac_game_issue(&self, index: u32) -> Option<String> {
+        let store = self.legacy_store(index).ok()?;
+        if store.get("gamePlatform").and_then(Value::as_str) != Some("darwin") {
+            return None;
+        }
+        let game = PathBuf::from(store.get("gamePath").and_then(Value::as_str)?);
+        let game = fs::canonicalize(&game).unwrap_or(game);
+        let root = fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+        (!game.starts_with(&root)).then(|| {
+            "Uses your original game, so mods can't be applied here. Add the game again to make a copy Deltamod can patch.".to_owned()
+        })
     }
     pub fn legacy_system_index(&self) -> Result<Value, RuntimeError> {
         let path = self.root.join("profiles").join("installations.json");
@@ -1700,6 +1723,35 @@ mod tests {
 
         assert_eq!(fs::read(source.join("data.win")).unwrap(), b"external");
         assert!(!runtime.root.join("deltamod_system-4").exists());
+    }
+
+    #[test]
+    fn original_mac_game_installations_are_flagged_but_managed_copies_are_not() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("Applications");
+        fs::create_dir(&source).unwrap();
+        let runtime = Runtime::open(directory.path().join("runtime")).unwrap();
+        let mut mac = legacy_store_fields();
+        mac.insert("gamePlatform".into(), json!("darwin"));
+        runtime
+            .legacy_create_installation(0, &source, "Original".into(), false, mac.clone())
+            .unwrap();
+        runtime
+            .legacy_create_installation(1, &source, "Copy".into(), true, mac)
+            .unwrap();
+        runtime
+            .legacy_create_installation(2, &source, "Windows".into(), false, legacy_store_fields())
+            .unwrap();
+
+        let listed = runtime.legacy_installations().unwrap();
+        let issues = |index: usize| listed[index]["issues"].as_array().unwrap().len();
+        assert_eq!(issues(0), 1);
+        assert_eq!(listed[0]["valid"], json!(true));
+        assert_eq!(issues(1), 0);
+        assert_eq!(issues(2), 0);
+        // The note is computed on read and never persisted.
+        let stored: ProfileStore = load_json(&runtime.legacy_profile_store_path()).unwrap();
+        assert!(stored.installations[0].issues.as_ref().unwrap().is_empty());
     }
 
     #[test]
