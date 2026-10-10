@@ -1038,6 +1038,7 @@ impl Runtime {
                 .map_err(|error| Error::Transaction(error.to_string()))?;
             let mut matching = Vec::new();
             let mut identities = std::collections::BTreeSet::new();
+            let mut interrupted_identity = false;
             for known_id in [&installation_id, &current_legacy_id] {
                 if store
                     .manifest(known_id)
@@ -1054,6 +1055,7 @@ impl Runtime {
                 let id = &interrupted.record.request.intent().installation_id;
                 if id == &installation_id || id == &current_legacy_id {
                     identities.insert(id.clone());
+                    interrupted_identity = true;
                 }
             }
             for journal in journals {
@@ -1078,10 +1080,23 @@ impl Runtime {
                 }
             }
             if identities.len() > 1 {
-                return Err(Error::Transaction(
-                    "multiple recovery identities for this game; refusing to adopt a new baseline"
-                        .into(),
-                ));
+                if interrupted_identity
+                    || !superseded_mac_identities_are_at_rest(
+                        &store,
+                        &installation_id,
+                        &identities,
+                        &matching,
+                    )?
+                {
+                    return Err(Error::Transaction(
+                        "multiple recovery identities for this game; refusing to adopt a new baseline"
+                            .into(),
+                    ));
+                }
+                // Only the stable identity remains authoritative; the legacy
+                // history stays in the store untouched.
+                identities.retain(|id| id == &installation_id);
+                matching.retain(|journal| journal.installation_id == installation_id);
             }
             if let Some(existing) = identities.into_iter().next() {
                 installation_id = existing;
@@ -1888,6 +1903,71 @@ fn lifecycle_installation_id(game_root: &Path, _platform: PatchPlatform) -> Stri
     }
 }
 
+/// Decides whether a macOS game tracked under both a boot-local legacy
+/// identity and the stable identity can continue under the stable one.
+///
+/// Builds before the stable volume identity could miss their own legacy
+/// history after a reboot and adopt a second baseline. That baseline is only a
+/// true original when every legacy identity finished at rest on its own
+/// baseline before the stable identity began, and both agree on every shared
+/// file. Anything else stays blocked, because the stable baseline might then
+/// hold modded files while the real original lives only in legacy history.
+#[cfg(unix)]
+fn superseded_mac_identities_are_at_rest(
+    store: &DurableLifecycleStore,
+    stable_id: &str,
+    identities: &std::collections::BTreeSet<String>,
+    journals: &[deltamod_product_contracts::LifecycleJournal],
+) -> Result<bool, Error> {
+    use deltamod_product_contracts::OperationPhase;
+    let transaction =
+        |error: deltamod_lifecycle_runtime::StoreError| Error::Transaction(error.to_string());
+    if !identities.contains(stable_id)
+        || store.manifest(stable_id).map_err(transaction)?.is_none()
+        || journals
+            .iter()
+            .any(|journal| journal.phase != OperationPhase::Complete)
+    {
+        return Ok(false);
+    }
+    let stable_generations = store.recovery_generations(stable_id).map_err(transaction)?;
+    let Some(stable_baseline) = stable_generations
+        .first()
+        .filter(|generation| generation.previous_manifest.is_none())
+    else {
+        return Ok(false);
+    };
+    let baseline_claims = stable_baseline
+        .target_manifest
+        .ledger
+        .claims
+        .iter()
+        .map(|claim| (claim.path_identity_key.as_str(), claim.sha256.as_str()))
+        .collect::<HashMap<_, _>>();
+    for legacy_id in identities.iter().filter(|id| id.as_str() != stable_id) {
+        let Some(legacy) = store.manifest(legacy_id).map_err(transaction)? else {
+            return Ok(false);
+        };
+        let at_baseline = legacy.records.iter().all(|record| {
+            record.instance_id == "active-patch-set"
+                && record.version.as_deref() == Some("baseline")
+        }) && !legacy.records.is_empty();
+        let legacy_generations = store.recovery_generations(legacy_id).map_err(transaction)?;
+        let finished_first = legacy_generations.last().is_some_and(|generation| {
+            generation.completion_sequence < stable_baseline.completion_sequence
+        });
+        let agrees = legacy.ledger.claims.iter().all(|claim| {
+            baseline_claims
+                .get(claim.path_identity_key.as_str())
+                .is_none_or(|sha256| sha256.eq_ignore_ascii_case(&claim.sha256))
+        });
+        if !at_baseline || !finished_first || !agrees {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(unix)]
 fn unix_installation_id(canonical: &Path, device: Option<u64>, inode: Option<u64>) -> String {
     use std::os::unix::ffi::OsStrExt as _;
@@ -2673,22 +2753,23 @@ name = "Test"
         );
     }
 
+    /// Simulates a build that missed the legacy history after a reboot and
+    /// adopted the game's current files as a baseline under the stable ID.
     #[cfg(unix)]
-    #[test]
-    fn conflicting_mac_recovery_identities_block_baseline_adoption() {
-        let (_root, runtime, lifecycle, legacy_id) = legacy_mac_recovery_fixture();
+    fn adopt_stable_baseline(runtime: &Runtime, lifecycle: &LifecycleStorageRoots) -> String {
         let (store, mut workspace, _) = runtime
             .open_lifecycle_context(&lifecycle.store, &lifecycle.workspace)
             .unwrap();
+        let current = fs::read(runtime.game_root.join("data.win")).unwrap();
         workspace
             .register_artifact_source("current-baseline", &runtime.game_root.join("data.win"))
             .unwrap();
         let files = vec![InstallFilePlan {
             path: ValidatedRelativePath::parse("data.win").unwrap(),
             path_identity_key: "data.win".into(),
-            sha256: sha2_digest(b"patched"),
-            size_bytes: 7,
-            expected_previous_sha256: Some(sha2_digest(b"patched")),
+            sha256: sha2_digest(&current),
+            size_bytes: current.len() as u64,
+            expected_previous_sha256: Some(sha2_digest(&current)),
             source: StagingSource::Artifact {
                 source_id: "current-baseline".into(),
             },
@@ -2728,7 +2809,12 @@ name = "Test"
             &mut workspace,
         ))
         .unwrap();
-        assert!(runtime.recover_startup_lifecycle(&lifecycle).is_err());
+        current_id
+    }
+
+    #[cfg(unix)]
+    fn assert_patching_blocked(runtime: &Runtime, lifecycle: &LifecycleStorageRoots) {
+        assert!(runtime.recover_startup_lifecycle(lifecycle).is_err());
         assert!(runtime
             .patch_staged_lifecycle(
                 &["id".into()],
@@ -2739,6 +2825,18 @@ name = "Test"
                 || false
             )
             .is_err());
+        let store = DurableLifecycleStore::open(&lifecycle.store).unwrap();
+        assert!(store.operation_by_id("blocked-session").unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conflicting_mac_recovery_identities_block_baseline_adoption() {
+        let (_root, runtime, lifecycle, legacy_id) = legacy_mac_recovery_fixture();
+        // The legacy identity is still patched, so the stable baseline holds
+        // modded bytes and must never become the restore target.
+        let current_id = adopt_stable_baseline(&runtime, &lifecycle);
+        assert_patching_blocked(&runtime, &lifecycle);
         assert_eq!(
             fs::read(runtime.game_root.join("data.win")).unwrap(),
             b"patched"
@@ -2746,7 +2844,68 @@ name = "Test"
         let store = DurableLifecycleStore::open(&lifecycle.store).unwrap();
         assert!(store.manifest(&legacy_id).unwrap().is_some());
         assert!(store.manifest(&current_id).unwrap().is_some());
-        assert!(store.operation_by_id("blocked-session").unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restored_legacy_mac_identity_yields_to_matching_stable_baseline() {
+        let (_root, runtime, lifecycle, legacy_id) = legacy_mac_recovery_fixture();
+        runtime
+            .uninstall_active_patch_set("restore-legacy", &lifecycle.store, &lifecycle.workspace)
+            .unwrap();
+        assert_eq!(
+            fs::read(runtime.game_root.join("data.win")).unwrap(),
+            b"original"
+        );
+        let current_id = adopt_stable_baseline(&runtime, &lifecycle);
+        let (_, _, resolved) = runtime
+            .open_lifecycle_context(&lifecycle.store, &lifecycle.workspace)
+            .unwrap();
+        assert_eq!(resolved, current_id);
+        runtime.recover_startup_lifecycle(&lifecycle).unwrap();
+        runtime
+            .patch_staged_lifecycle(
+                &["id".into()],
+                "stable-session",
+                &lifecycle.store,
+                &lifecycle.workspace,
+                |_| {},
+                || false,
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read(runtime.game_root.join("data.win")).unwrap(),
+            b"patched"
+        );
+        runtime
+            .uninstall_active_patch_set("restore-stable", &lifecycle.store, &lifecycle.workspace)
+            .unwrap();
+        assert_eq!(
+            fs::read(runtime.game_root.join("data.win")).unwrap(),
+            b"original"
+        );
+        // Legacy history is kept, never rewritten.
+        let store = DurableLifecycleStore::open(&lifecycle.store).unwrap();
+        let legacy = store.manifest(&legacy_id).unwrap().unwrap();
+        assert_eq!(legacy.records[0].version.as_deref(), Some("baseline"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restored_legacy_mac_identity_blocks_a_disagreeing_stable_baseline() {
+        let (_root, runtime, lifecycle, _) = legacy_mac_recovery_fixture();
+        runtime
+            .uninstall_active_patch_set("restore-legacy", &lifecycle.store, &lifecycle.workspace)
+            .unwrap();
+        // Something outside Deltamod changed the game before the stable
+        // baseline was taken, so it no longer matches the legacy original.
+        fs::write(runtime.game_root.join("data.win"), b"tampered").unwrap();
+        adopt_stable_baseline(&runtime, &lifecycle);
+        assert_patching_blocked(&runtime, &lifecycle);
+        assert_eq!(
+            fs::read(runtime.game_root.join("data.win")).unwrap(),
+            b"tampered"
+        );
     }
 
     #[test]

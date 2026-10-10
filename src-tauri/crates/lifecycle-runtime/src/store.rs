@@ -1262,6 +1262,31 @@ impl DurableLifecycleStore {
         generation.map(decode_generation).transpose()
     }
 
+    /// Returns every viable, completed recovery generation for one
+    /// installation in completion order. Read-only; it does not touch LRU state.
+    pub fn recovery_generations(
+        &self,
+        installation_id: &str,
+    ) -> Result<Vec<RecoveryGenerationSnapshot>, StoreError> {
+        let (_lock, state) = self.lock_and_load()?;
+        let mut generations = state
+            .generations
+            .values()
+            .filter(|generation| {
+                generation.installation_id == installation_id
+                    && generation.viable
+                    && generation.completed_at_ms.is_some()
+                    && generation.completion_sequence.is_some()
+                    && !state
+                        .pending_generation_deletions
+                        .contains_key(&generation.generation_id)
+            })
+            .map(decode_generation)
+            .collect::<Result<Vec<_>, _>>()?;
+        generations.sort_by_key(|generation| generation.completion_sequence);
+        Ok(generations)
+    }
+
     /// Records a successful read of a recovery generation for persisted LRU
     /// ordering. The expected completion sequence prevents an access update
     /// from reviving or touching a replaced/deleting generation.
