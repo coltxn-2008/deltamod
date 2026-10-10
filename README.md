@@ -162,10 +162,11 @@ UndertaleModTool `.csx` patches are supported on Windows x64, Linux x64, and Int
 
 ### Patching on macOS
 
-- **Managed copy.** When you add DELTARUNE on a Mac, Deltamod copies only `DELTARUNE.app` into its own data folder and patches that copy. The game in `/Applications` is never changed, and Deltamod refuses to patch an installation that points at it.
+- **Managed copy.** When you add DELTARUNE on a Mac, Deltamod copies only `DELTARUNE.app` into its own data folder and patches that copy. The game in `/Applications` is never changed. Deltamod refuses to patch an installation that points at it, and the Install Manager marks such installations so you can add the game again as a copy.
 - **Windows reference files.** Most DELTARUNE mods are xdelta patches made against the Windows `data.win`. The Mac `game.ios` files are packed differently, so those patches do not apply to them directly. Under **Options → Installation → Windows reference files**, choose a Windows copy of the same game version once. Deltamod applies mods to those `data.win` files with G3MTool and installs the result in the copy as `game.ios`. Mods that only replace files, such as music, do not need them.
 - **Game-version checks.** For a mod's reference-backed patch targets, required-file checks use the Windows reference copy. Other required files are checked in the managed game copy. A missing, unsafe, or mismatching reference file still blocks the mod when hash checks are enabled.
-- **Re-signing.** Changing files inside an app bundle breaks its signature, so Deltamod clears the quarantine flag on the copy and ad-hoc re-signs it with `codesign` after every patch and restore.
+- **Re-signing.** Changing files inside an app bundle breaks its signature, so Deltamod clears the quarantine flag on the copy and ad-hoc re-signs it with `codesign` after every patch and restore. If re-signing fails, the patch screen shows a warning.
+- **Recovery after older builds.** Older builds without the stable volume identity could record a copy's recovery history under a key that changed after a reboot. Deltamod continues under the stable key only when the older history ended on the original files before the newer history began. Otherwise it refuses to patch rather than risk treating modded files as the original.
 - **Saves are shared.** The copy and the original game both use `~/Library/Application Support/com.tobyfox.deltarune`. Back up your saves before trying new mods.
 
 Options → Mac explains the same steps inside the app.
