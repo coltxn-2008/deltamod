@@ -15,9 +15,42 @@ const targets = {
 };
 if (!targets[rustTarget]) throw new Error('A supported Rust target is required for butler staging.');
 
+const sha256 = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+
+/**
+ * Reuses an earlier staging only when its provenance names this exact archive
+ * and every staged file still matches the hash recorded when it was extracted
+ * from that checksum-verified archive. Anything else downloads again.
+ */
+function stagedCopyIsCurrent(destination, url, archiveHash, executable, executableHash) {
+  if (process.env.CI || process.env.DELTAMOD_REFRESH_BUTLER) return false;
+  try {
+    const provenance = JSON.parse(fs.readFileSync(path.join(destination, 'provenance.json'), 'utf8'));
+    const files = provenance.files;
+    if (provenance.version !== '15.30.0' || provenance.source !== url || provenance.archiveSha256 !== archiveHash
+      || provenance.executable !== executable || provenance.sha256 !== executableHash
+      || !files || typeof files !== 'object' || files[executable] !== executableHash) return false;
+    const staged = fs.readdirSync(destination).filter(name => name !== 'provenance.json').sort();
+    const recorded = Object.keys(files).sort();
+    if (staged.length !== recorded.length || staged.some((name, index) => name !== recorded[index])) return false;
+    return staged.every(name => {
+      const file = path.join(destination, name);
+      const stat = fs.lstatSync(file);
+      return stat.isFile() && !stat.isSymbolicLink() && sha256(file) === files[name];
+    });
+  } catch {
+    return false;
+  }
+}
+
 (async () => {
   const [platform, archiveHash, executable, executableHash] = targets[rustTarget];
   const url = `https://broth.itch.zone/butler/${platform}/15.30.0/archive/default`;
+  const destination = path.join(root, 'src-tauri', 'resources', 'third-party', 'butler');
+  if (stagedCopyIsCurrent(destination, url, archiveHash, executable, executableHash)) {
+    console.log('Reusing checksum-verified butler staging.');
+    return;
+  }
   const response = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(120000) });
   if (!response.ok) throw new Error(`butler acquisition failed with HTTP ${response.status}`);
   const bytes = Buffer.from(await response.arrayBuffer());
@@ -39,13 +72,16 @@ if (!targets[rustTarget]) throw new Error('A supported Rust target is required f
     await sevenZip.unpack(archive, extracted);
     const source = path.join(extracted, executable);
     if (crypto.createHash('sha256').update(fs.readFileSync(source)).digest('hex') !== executableHash) throw new Error('butler executable checksum mismatch.');
-    const destination = path.join(root, 'src-tauri', 'resources', 'third-party', 'butler');
     fs.rmSync(destination, { recursive: true, force: true });
     fs.mkdirSync(destination, { recursive: true });
-    for (const entry of fs.readdirSync(extracted)) fs.copyFileSync(path.join(extracted, entry), path.join(destination, entry));
+    const files = {};
+    for (const entry of fs.readdirSync(extracted)) {
+      fs.copyFileSync(path.join(extracted, entry), path.join(destination, entry));
+      files[entry] = sha256(path.join(destination, entry));
+    }
     fs.writeFileSync(path.join(destination, 'provenance.json'), JSON.stringify({
       version: '15.30.0', source: url, archiveSha256: archiveHash,
-      executable, sha256: executableHash, license: 'MIT'
+      executable, sha256: executableHash, license: 'MIT', files
     }, null, 2) + '\n');
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
